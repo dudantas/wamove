@@ -119,7 +119,6 @@ def write_png(path: Path, width: int, height: int) -> None:
                      + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="thumbnails use sips")
 def test_image_thumbnail(tmp_path: Path) -> None:
     make_msgstore(tmp_path / "msgstore.db")
     make_media(tmp_path / "Media")

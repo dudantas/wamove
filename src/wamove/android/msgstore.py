@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections import Counter
 from pathlib import Path
 
 from ..model import MEDIA_KINDS, Archive, Chat, Kind, Location, Media, Message, Participant
@@ -27,6 +28,12 @@ TYPES = {
 }
 SKIPPED_KINDS = (Kind.SYSTEM, Kind.REVOKED)
 SKIPPED_SUFFIXES = ("@broadcast", "@newsletter", "@bot")
+# These contain related data that the writer does not map to the iOS schema.
+# Reporting their row counts does not imply that every row is a separate message.
+UNCONVERTED_TABLES = (
+    "message_add_on", "message_add_on_reaction", "message_quoted", "message_poll",
+    "message_poll_option", "message_poll_vote", "message_edit_info", "message_edit_history", "call_log",
+)
 
 
 class MsgstoreError(Exception):
@@ -77,13 +84,20 @@ def _is_voice(mime: str | None, path: str | None) -> bool:
     return bool(mime and "opus" in mime.lower()) or bool(path and "/WhatsApp Voice Notes/" in path)
 
 
-def parse(path: Path, contacts: dict[str, str] | None = None) -> Archive:
+def parse(path: Path, contacts: dict[str, str] | None = None, *, exclude_groups: bool = False) -> Archive:
     contacts = contacts or {}
     conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     tables = _tables(conn)
     if not {"message", "chat", "jid"} <= tables.keys():
+        conn.close()
         raise MsgstoreError("unsupported msgstore.db: update WhatsApp on the Android phone and back up again")
+    unconverted = {}
+    for table in UNCONVERTED_TABLES:
+        if table in tables:
+            count = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            if count:
+                unconverted[table] = count
 
     lid_to_pn = _lid_map(conn, tables)
     pn_to_lid = {pn: lid for lid, pn in lid_to_pn.items()}
@@ -97,6 +111,7 @@ def parse(path: Path, contacts: dict[str, str] | None = None) -> Archive:
 
     by_row: dict[int, Chat] = {}
     by_jid: dict[str, Chat] = {}
+    excluded_groups: set[int] = set()
     chat_sql = (
         f"SELECT chat._id AS id, jid.raw_string AS raw, {_col(tables, 'chat', 'subject')}, "
         f"{_col(tables, 'chat', 'created_timestamp')}, {_col(tables, 'chat', 'archived', '0')} "
@@ -107,6 +122,9 @@ def parse(path: Path, contacts: dict[str, str] | None = None) -> Archive:
         if not raw or raw.endswith(SKIPPED_SUFFIXES):
             continue
         jid = phone(raw)
+        if exclude_groups and jid.endswith("@g.us"):
+            excluded_groups.add(row["id"])
+            continue
         chat = by_jid.get(jid)
         if chat is None:
             group = jid.endswith("@g.us")
@@ -158,12 +176,21 @@ def parse(path: Path, contacts: dict[str, str] | None = None) -> Archive:
         "FROM message LEFT JOIN jid sender ON sender._id = message.sender_jid_row_id "
         f"{' '.join(joins)} ORDER BY message.timestamp, message._id"
     )
+    skipped: Counter[str] = Counter()
+    downgraded: Counter[int] = Counter()
+    source_messages = 0
     for row in conn.execute(message_sql):
+        source_messages += 1
         chat = by_row.get(row["chat_id"])
-        if chat is None or not row["key_id"] or row["ts"] is None:
+        if chat is None:
+            skipped["excluded_group" if row["chat_id"] in excluded_groups else "excluded_chat"] += 1
+            continue
+        if not row["key_id"] or row["ts"] is None:
+            skipped["missing_id_or_timestamp"] += 1
             continue
         kind = TYPES.get(int(row["type"] or 0), Kind.UNKNOWN)
         if kind in SKIPPED_KINDS:
+            skipped[kind.value] += 1
             continue
         media = None
         if row["file_path"] or kind in MEDIA_KINDS:
@@ -184,7 +211,14 @@ def parse(path: Path, contacts: dict[str, str] | None = None) -> Archive:
             location = Location(float(row["latitude"]), float(row["longitude"] or 0), row["place_name"])
         text = row["text"]
         if kind in (Kind.TEXT, Kind.UNKNOWN) and not text:
+            skipped[f"unsupported_type_{row['type']}" if kind is Kind.UNKNOWN else "empty_text"] += 1
             continue
+        if kind is Kind.UNKNOWN:
+            downgraded[int(row["type"])] += 1
+        elif row["type"] in (14, 16):
+            # Multiple contacts and live locations currently become a single
+            # contact card / static coordinate, not their complete native form.
+            downgraded[int(row["type"])] += 1
         sender = phone(row["sender"]) if "@" in (row["sender"] or "") and not row["from_me"] else None
         chat.messages.append(Message(
             key_id=row["key_id"],
@@ -213,7 +247,8 @@ def parse(path: Path, contacts: dict[str, str] | None = None) -> Archive:
                 found = name_of(message.sender_jid)
                 if found:
                     names[message.sender_jid] = found
-    return Archive(chats=chats, names=names, lids=pn_to_lid)
+    return Archive(chats=chats, names=names, lids=pn_to_lid, source_messages=source_messages,
+                   skipped=dict(skipped), downgraded_types=dict(downgraded), unconverted_tables=unconverted)
 
 
 def load_vcf(path: Path) -> dict[str, str]:

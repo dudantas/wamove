@@ -20,7 +20,12 @@ MEDIA_DIRS = (
     "WhatsApp Stickers",
     "WhatsApp Video Notes",
 )
-FALLBACK_ADB = ("/opt/homebrew/bin/adb", os.path.expanduser("~/Library/Android/sdk/platform-tools/adb"))
+FALLBACK_ADB = (
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Android", "Sdk", "platform-tools", "adb.exe"),
+    os.path.join(os.environ.get("ProgramData", "C:/ProgramData"), "chocolatey", "lib", "adb", "tools",
+                 "platform-tools", "adb.exe"),
+    "/opt/homebrew/bin/adb", os.path.expanduser("~/Library/Android/sdk/platform-tools/adb"),
+)
 
 
 class AdbError(Exception):
@@ -30,12 +35,12 @@ class AdbError(Exception):
 def _adb() -> str:
     exe = shutil.which("adb") or next((p for p in FALLBACK_ADB if os.path.isfile(p)), None)
     if not exe:
-        raise AdbError("adb not found; install it with: brew install --cask android-platform-tools")
+        raise AdbError("adb not found; install Android Platform Tools and put adb on PATH")
     return exe
 
 
 def run(*args: str, check: bool = True) -> str:
-    r = subprocess.run([_adb(), *args], capture_output=True, text=True, errors="replace")
+    r = subprocess.run([_adb(), *args], capture_output=True, text=True, encoding="utf-8", errors="replace")
     if check and r.returncode:
         raise AdbError(f"adb {' '.join(args)}: {(r.stderr or r.stdout).strip()}")
     return r.stdout
@@ -49,7 +54,7 @@ def device() -> str:
     rows = [line.split() for line in run("devices", "-l").splitlines()[1:] if line.strip()]
     ready = [row for row in rows if row[1] == "device"]
     if not rows:
-        raise AdbError("no Android phone found: turn on USB debugging, plug it in and allow this Mac")
+        raise AdbError("no Android phone found: turn on USB debugging, plug it in and allow this computer")
     if not ready:
         raise AdbError(f"the Android phone is '{rows[0][1]}': unlock it and accept the USB debugging prompt")
     if len(ready) > 1:

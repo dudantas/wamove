@@ -6,10 +6,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from pymobiledevice3.exceptions import NoDeviceConnectedError, PairingError
-from pymobiledevice3.lockdown import create_using_usbmux
-from pymobiledevice3.services.mobilebackup2 import Mobilebackup2Service
-
 
 class DeviceError(Exception):
     pass
@@ -35,15 +31,20 @@ def _progress(label: str) -> Callable[[float], None]:
 
 
 async def _lockdown(udid: str | None):
+    from pymobiledevice3.exceptions import NoDeviceConnectedError, PairingError
+    from pymobiledevice3.lockdown import create_using_usbmux
+
     try:
         return await create_using_usbmux(serial=udid)
     except NoDeviceConnectedError as e:
         raise DeviceError("no iPhone found: plug it in and unlock it") from e
     except PairingError as e:
-        raise DeviceError("the iPhone does not trust this Mac yet: unlock it and tap Trust") from e
+        raise DeviceError("the iPhone does not trust this computer yet: unlock it and tap Trust") from e
 
 
 async def _service(lockdown) -> Mobilebackup2Service:
+    from pymobiledevice3.services.mobilebackup2 import Mobilebackup2Service
+
     for attempt in range(3):
         service = Mobilebackup2Service(lockdown)
         try:

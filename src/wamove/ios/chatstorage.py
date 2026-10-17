@@ -9,7 +9,7 @@ import re
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from ..model import MEDIA_KINDS, Archive, Chat, Kind, Message
 from . import thumbs
@@ -96,22 +96,28 @@ def _section(ms: int) -> str:
 
 @functools.lru_cache(maxsize=4)
 def _media_index(root: str) -> dict[str, str]:
-    index: dict[str, str] = {}
+    index: dict[str, str | None] = {}
     for directory, _, files in os.walk(root):
         for name in files:
-            index.setdefault(name, os.path.join(directory, name))
-    return index
+            # A basename alone cannot identify a file when duplicates exist.
+            index[name] = None if name in index else os.path.join(directory, name)
+    return {name: path for name, path in index.items() if path is not None}
 
 
 def _locate(android_path: str | None, media_root: str) -> str | None:
     if not android_path:
         return None
-    relative = android_path.lstrip("/")
-    relative = relative[len("Media/"):] if relative.startswith("Media/") else relative
-    candidate = os.path.join(media_root, relative)
-    if os.path.isfile(candidate):
-        return candidate
-    return _media_index(media_root).get(os.path.basename(relative))
+    parts = PurePosixPath(android_path.replace("\\", "/")).parts
+    if "Media" in parts:
+        parts = parts[parts.index("Media") + 1:]
+    if not parts or ".." in parts or any(":" in part for part in parts):
+        return None
+    root = Path(media_root).resolve()
+    candidate = root.joinpath(*parts).resolve()
+    if candidate.is_relative_to(root) and candidate.is_file():
+        return str(candidate)
+    match = _media_index(media_root).get(parts[-1])
+    return match if match and Path(match).resolve().is_relative_to(root) else None
 
 
 class Writer:
@@ -170,10 +176,11 @@ class Writer:
                                     f"{SYSTEM_TYPES}", 0),
         }
         conv["flags_by_type"] = {}
-        for from_me, kind, flags, _ in self.conn.execute(
-                "SELECT ZISFROMME, ZMESSAGETYPE, ZFLAGS, COUNT(*) FROM ZWAMESSAGE WHERE ZFLAGS IS NOT NULL "
-                "GROUP BY 1, 2, 3 ORDER BY 4"):
-            conv["flags_by_type"][f"{from_me}:{kind}"] = flags
+        for session_type, from_me, kind, flags, _ in self.conn.execute(
+                "SELECT s.ZSESSIONTYPE, m.ZISFROMME, m.ZMESSAGETYPE, m.ZFLAGS, COUNT(*) "
+                "FROM ZWAMESSAGE m JOIN ZWACHATSESSION s ON s.Z_PK=m.ZCHATSESSION WHERE m.ZFLAGS IS NOT NULL "
+                "GROUP BY 1, 2, 3, 4 ORDER BY 5"):
+            conv["flags_by_type"][f"{session_type}:{from_me}:{kind}"] = flags
         conv["pushname_is_blob"] = _is_blob(self._sample(
             "SELECT ZPUSHNAME FROM ZWAMESSAGE WHERE ZPUSHNAME IS NOT NULL AND ZPUSHNAME<>''"))
         conv["lasttext_is_blob"] = _is_blob(self._sample(
@@ -240,10 +247,24 @@ class Writer:
             "ORDER BY ZSESSIONTYPE LIMIT 1", keys + keys).fetchone()
 
     def import_archive(self, archive: Archive, media_root: Path | None, thumbnails: Path | None = None) -> Report:
+        try:
+            return self._import_archive(archive, media_root, thumbnails)
+        except Exception:
+            self.conn.rollback()
+            self.entities = {
+                r["Z_NAME"]: {"ent": r["Z_ENT"], "max": r["Z_MAX"] or 0}
+                for r in self.conn.execute("SELECT Z_ENT, Z_NAME, Z_MAX FROM Z_PRIMARYKEY")
+            }
+            raise
+
+    def _import_archive(self, archive: Archive, media_root: Path | None, thumbnails: Path | None) -> Report:
         report = Report()
+        _media_index.cache_clear()
         self.thumbnails = thumbnails
         touched: set[int] = set()
         for chat in archive.chats:
+            if not chat.messages:
+                continue
             session = self._import_chat(chat, archive, report, str(media_root) if media_root else None)
             if session is not None:
                 touched.add(session)
@@ -258,7 +279,7 @@ class Writer:
         return report
 
     def close(self) -> None:
-        self.conn.commit()
+        self.conn.rollback()
         self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         self.conn.execute("PRAGMA journal_mode=DELETE")
         self.conn.close()
@@ -324,28 +345,36 @@ class Writer:
         return pk
 
     def _import_chat(self, chat: Chat, archive: Archive, report: Report, media_root: str | None) -> int | None:
+        if chat.is_group:
+            needed = {"ZWAGROUPMEMBER": "WAGroupMember", "ZWAGROUPINFO": "WAGroupInfo"}
+            if any(table not in self.columns or entity not in self.entities for table, entity in needed.items()):
+                raise ChatStorageError("this iPhone schema lacks group tables; use --exclude-groups")
+            if any(not m.from_me and not m.sender_jid for m in chat.messages):
+                raise ChatStorageError("a group message has no sender; refusing to import it anonymously")
         session, existing = self._session(chat, report)
         media_dir = chat.jid if chat.is_group else (chat.lid or chat.jid)
         members = self._members(session) if chat.is_group else {}
         for participant in chat.participants if chat.is_group else ():
             self._member(session, members, participant.jid, participant.name or archive.names.get(participant.jid),
                          participant.is_admin, True)
-        seen = {r[0] for r in self.conn.execute(
-            "SELECT ZSTANZAID FROM ZWAMESSAGE WHERE ZCHATSESSION=? AND ZSTANZAID IS NOT NULL", (session,))}
+        seen = {(r[0], bool(r[1]), (r[2] or 0) if chat.is_group else 0) for r in self.conn.execute(
+            "SELECT ZSTANZAID, ZISFROMME, ZGROUPMEMBER FROM ZWAMESSAGE "
+            "WHERE ZCHATSESSION=? AND ZSTANZAID IS NOT NULL", (session,))}
         last_pk = last_date = last_text = None
         written = 0
-        for message in chat.messages:
-            if message.key_id in seen:
-                report.messages_skipped += 1
-                continue
-            seen.add(message.key_id)
+        for message in sorted(chat.messages, key=lambda m: m.timestamp_ms):
             member = None
             if chat.is_group and not message.from_me and message.sender_jid:
                 member = self._member(session, members, message.sender_jid,
                                       archive.names.get(message.sender_jid), False, False)
+            identity = (message.key_id, message.from_me, (member or 0) if chat.is_group else 0)
+            if identity in seen:
+                report.messages_skipped += 1
+                continue
+            seen.add(identity)
             last_pk = self._message(chat, session, message, member, archive, report, media_root, media_dir)
             last_date = cocoa(message.timestamp_ms)
-            last_text = message.text if message.kind is Kind.TEXT else last_text
+            last_text = message.text if message.kind is Kind.TEXT else None
             written += 1
             report.messages_written += 1
         if last_pk is None:
@@ -382,7 +411,8 @@ class Writer:
             "ZMESSAGESTATUS": conv["msg_status_out"] if message.from_me else conv["msg_status_in"],
             "ZMESSAGEERRORSTATUS": 0,
             "ZSTARRED": int(message.starred),
-            "ZFLAGS": conv["flags_by_type"].get(f"{int(message.from_me)}:{kind_type}", fallback),
+            "ZFLAGS": conv["flags_by_type"].get(f"{GROUP if chat.is_group else INDIVIDUAL}:"
+                                                f"{int(message.from_me)}:{kind_type}", fallback),
             "ZSPOTLIGHTSTATUS": conv["msg_spot"],
             "ZDOCID": 0,
             "ZCHILDMESSAGESDELIVEREDCOUNT": 0,
@@ -460,9 +490,10 @@ class Writer:
         if self.thumbnails is None:
             return None
         target = self.thumbnails / f"{name}.thumb"
-        if kind is Kind.IMAGE:
+        if kind in (Kind.IMAGE, Kind.STICKER, Kind.GIF):
             measured = thumbs.image(local, target)
-            return (target, measured) if measured else None
+            if measured:
+                return target, measured
         if kind in (Kind.VIDEO, Kind.GIF) and thumbs.video(local, target):
             return target, None
         return None
@@ -492,9 +523,19 @@ def verify(path: Path) -> list[str]:
         "WHERE s.Z_PK IS NULL").fetchone()[0]
     if orphans:
         problems.append(f"{orphans} messages belong to no chat")
+    if "ZWAGROUPMEMBER" in tables:
+        broken = conn.execute(
+            "SELECT COUNT(*) FROM ZWAMESSAGE m JOIN ZWACHATSESSION s ON s.Z_PK=m.ZCHATSESSION "
+            "LEFT JOIN ZWAGROUPMEMBER g ON g.Z_PK=m.ZGROUPMEMBER "
+            "WHERE s.ZSESSIONTYPE=1 AND m.ZISFROMME=0 AND m.ZMESSAGETYPE NOT IN (6,10) "
+            "AND (g.Z_PK IS NULL OR g.ZCHATSESSION IS NOT m.ZCHATSESSION)").fetchone()[0]
+        if broken:
+            problems.append(f"{broken} incoming group messages have a missing or mismatched sender")
     duplicates = conn.execute(
-        "SELECT COUNT(*) FROM (SELECT ZCHATSESSION, ZSTANZAID FROM ZWAMESSAGE WHERE ZSTANZAID IS NOT NULL "
-        "GROUP BY 1, 2 HAVING COUNT(*) > 1)").fetchone()[0]
+        "SELECT COUNT(*) FROM (SELECT m.ZCHATSESSION, m.ZSTANZAID, m.ZISFROMME, "
+        "CASE WHEN s.ZSESSIONTYPE=1 THEN COALESCE(m.ZGROUPMEMBER,0) ELSE 0 END "
+        "FROM ZWAMESSAGE m JOIN ZWACHATSESSION s ON s.Z_PK=m.ZCHATSESSION WHERE m.ZSTANZAID IS NOT NULL "
+        "GROUP BY 1, 2, 3, 4 HAVING COUNT(*) > 1)").fetchone()[0]
     if duplicates:
         problems.append(f"{duplicates} messages are duplicated within a chat")
     conn.close()

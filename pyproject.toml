@@ -12,6 +12,8 @@ license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 dependencies = [
     "cryptography>=41",
+    "Pillow>=10",
+    "pyiosbackup>=0.2.4",
     "pymobiledevice3>=11.19",
 ]
 

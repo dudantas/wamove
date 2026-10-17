@@ -1,5 +1,8 @@
 # wamove
 
+See [Compatibility and validation](COMPATIBILITY.md) for Windows setup,
+conversion coverage, group migration checks, and remaining limits.
+
 Move WhatsApp chats and media from an Android phone to an iPhone that is **already set up**, without erasing the iPhone.
 
 WhatsApp's own Android → iPhone transfer only works while setting up a new or erased iPhone, through the Move to iOS app. If the iPhone is already in use, the official answer is to reset it. wamove works around that by editing WhatsApp's data inside an iPhone backup on your Mac and restoring only that data.
@@ -15,11 +18,14 @@ WhatsApp's own Android → iPhone transfer only works while setting up a new or 
 2. `decrypt` decrypts the backup with its 64-digit end-to-end encryption key.
 3. `backup` takes a full backup of the iPhone, then keeps a copy with only WhatsApp's data in it.
 4. `build` adds the Android chats and media to WhatsApp's iPhone database (`ChatStorage.sqlite`) in that copy. It learns the conventions from the rows WhatsApp itself wrote on the iPhone, so the new rows look like WhatsApp's own.
-5. `restore` restores the WhatsApp-only copy to the iPhone. Everything else on the phone is left alone.
+5. `restore` restores the WhatsApp-only copy to the iPhone. The backup manifest targets WhatsApp's shared app data, but the iOS restore procedure still restarts the phone and can reopen setup screens or change the home-screen layout.
 
 Nothing is uploaded anywhere. Both phones talk to the Mac over USB.
 
 ## Requirements
+
+The installation steps below are for macOS. For Windows, use the
+[Python setup and device prerequisites](COMPATIBILITY.md#installation-and-offline-checks).
 
 - A Mac with the Xcode Command Line Tools (`xcode-select --install`)
 - [uv](https://docs.astral.sh/uv/) (`brew install uv`)
@@ -69,8 +75,17 @@ Plug the iPhone into the Mac, unlock it and trust the Mac.
 wamove backup     # full backup, then a WhatsApp-only copy; asks for the backup password if backups are encrypted
 wamove inspect    # optional: what is on each side
 wamove build      # adds the Android chats to the WhatsApp-only copy
-wamove restore    # the iPhone restarts when done
+wamove restore    # refuses conversions with reported omissions by default
 ```
+
+Review `ios/build/report.json` after the build. If you accept its skipped messages,
+reduced representations, missing media, or unconverted features, run
+`wamove restore --accept-partial`. This acknowledges those omissions; it does not
+establish that every feature will display correctly in WhatsApp.
+
+Commands refuse to overwrite existing Android data, iPhone backups, or build
+outputs. Keep the previous workspace and use a separate `--work DIR` for another
+attempt. Do not delete the only recovery copy to rerun a command.
 
 ### 3. After the restore
 
@@ -88,9 +103,10 @@ When you are happy, delete `~/wamove`. It holds your decrypted chats.
 | `pull [--no-media]` | Copies the chat backup, contact names and media off the Android phone |
 | `decrypt [--key-file FILE]` | Decrypts the chat backup and prints how many chats and messages it has |
 | `backup` | Takes a full iPhone backup and makes the WhatsApp-only copy |
+| `audit [--exclude-groups]` | Reports conversion coverage from decrypted Android data without contacting either phone |
 | `inspect` | Shows the Android chats and what is in the iPhone's WhatsApp database |
-| `build [--no-media]` | Writes the Android chats (and media) into the WhatsApp-only copy and checks the result |
-| `restore` | Restores the built copy to the iPhone |
+| `build [--no-media] [--exclude-groups]` | Writes the Android chats (and media) into a new WhatsApp-only copy and records checks and coverage |
+| `restore [--accept-partial]` | Restores the validated copy to its matching iPhone; explicit acceptance is required for reported omissions |
 | `rollback` | Restores the untouched WhatsApp-only copy to the iPhone |
 
 Options that go before the command:
@@ -123,7 +139,7 @@ Not moved: system messages ("X joined"), deleted-message markers, call logs, rea
 
 Tested once, in September 2026, from a Pixel 10 Pro XL to an iPhone on iOS 27.0: 64 one-to-one chats with about 25,000 messages and 889 media files came across, with thumbnails, and media opened.
 
-- The history of **group chats** was written to the database but did not show up in WhatsApp after the restore. The cause is not known yet.
+- In that earlier test, **group history** was written to the database but did not show up in WhatsApp. A later migration with the mapping fixes in this revision produced an initial user report that group history appeared. This is not confirmation across all versions or a complete check of authors, dates, and attachments; see [validation limits](COMPATIBILITY.md#validation).
 - WhatsApp changes its database between versions. If `build` fails its checks, WhatsApp on the iPhone has probably changed something wamove does not know about yet. Please open an issue with the output of `wamove inspect`.
 
 ## Troubleshooting

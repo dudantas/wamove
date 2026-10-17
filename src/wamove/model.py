@@ -84,6 +84,10 @@ class Archive:
     chats: list[Chat]
     names: dict[str, str] = field(default_factory=dict)
     lids: dict[str, str] = field(default_factory=dict)
+    source_messages: int = 0
+    skipped: dict[str, int] = field(default_factory=dict)
+    downgraded_types: dict[int, int] = field(default_factory=dict)
+    unconverted_tables: dict[str, int] = field(default_factory=dict)
 
     def stats(self) -> dict[str, int]:
         return {

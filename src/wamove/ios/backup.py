@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import struct
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,10 +35,19 @@ def file_id(domain: str, relative_path: str) -> str:
 
 
 def clone_tree(src: Path, dst: Path) -> None:
+    if dst.exists():
+        raise BackupError(f"refusing to overwrite an existing backup: {dst}")
+    if src.resolve() == dst.resolve() or src.resolve() in dst.resolve().parents:
+        raise BackupError("the backup copy must be outside the source folder")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if subprocess.run(["cp", "-Rc", str(src), str(dst)], capture_output=True).returncode:
-        shutil.rmtree(dst, ignore_errors=True)
-        shutil.copytree(src, dst)
+    # APFS cloning is a macOS optimization, not a portable copy command.
+    if sys.platform == "darwin" and shutil.which("cp"):
+        if subprocess.run(["cp", "-Rc", str(src), str(dst)], capture_output=True).returncode == 0:
+            return
+        # A failed copy is kept for inspection; never delete a supplied path.
+        if dst.exists():
+            raise BackupError(f"backup clone failed; partial copy retained at {dst}")
+    shutil.copytree(src, dst)
 
 
 def is_encrypted(path: Path) -> bool:
